@@ -61,7 +61,7 @@ class Room < ApplicationRecord
   end
 
   def default_involvement
-    "everything"
+    "mentions"
   end
 
   private

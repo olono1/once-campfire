@@ -87,3 +87,12 @@
     inline-size: auto;
   }
 }
+
+.account-logo-link {
+  text-decoration: none;
+  color: inherit;
+  
+  &:hover {
+    text-decoration: none;
+  }
+}

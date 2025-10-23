@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# bin/docker-deploy
+# Builds the Docker image and runs the container, generating VAPID keys and SECRET_KEY_BASE when needed.
+# Usage: bin/docker-deploy [--domain DOMAIN] [--image-tag TAG]
+
+# Defaults
+IMAGE_TAG="campfire"
+DOMAIN="dev.chat.pios.com"
+VOLUME_NAME="campfire_storage"
+
+usage() {
+  cat <<EOF
+Usage: $0 [--domain DOMAIN] [--image-tag TAG] [--no-run]
+
+Options:
+  --domain DOMAIN    TLS domain for VAPID/TLS (default: ${DOMAIN})
+  --image-tag TAG   Docker image tag (default: ${IMAGE_TAG})
+  --no-run          Build and print env values but don't run the container
+
+This script will:
+  - Build the Docker image
+  - Generate VAPID key pair (P-256) if VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not set
+  - Generate SECRET_KEY_BASE if not set
+  - Run docker with the right env vars and volume
+EOF
+}
+
+# Parse args
+NO_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain) DOMAIN="$2"; shift 2;;
+    --image-tag) IMAGE_TAG="$2"; shift 2;;
+    --no-run) NO_RUN=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1"; usage; exit 1;;
+  esac
+done
+
+# Build image
+echo "Building Docker image: ${IMAGE_TAG}"
+docker build -t "${IMAGE_TAG}" .
+
+# Generate SECRET_KEY_BASE if not exported
+if [[ -z "${SECRET_KEY_BASE:-}" ]]; then
+  if command -v ruby >/dev/null 2>&1; then
+    SECRET_KEY_BASE=$(ruby -e 'require "securerandom"; puts SecureRandom.hex(64)')
+  else
+    SECRET_KEY_BASE=$(openssl rand -hex 64)
+  fi
+  echo "Generated SECRET_KEY_BASE"
+fi
+
+# Generate VAPID keys if not set
+# We want the keys in base64url (no padding), uncompressed point for public key
+# Private key: base64url of the raw 32-byte scalar
+# Public key: base64url of the uncompressed SEC1 point (0x04 || X || Y)
+
+if [[ -z "${VAPID_PUBLIC_KEY:-}" || -z "${VAPID_PRIVATE_KEY:-}" ]]; then
+  echo "Generating VAPID key pair (P-256)..."
+
+  # create temp dir
+  TMPDIR=$(mktemp -d)
+  trap 'rm -rf "$TMPDIR"' EXIT
+
+  # Generate EC private key
+  openssl ecparam -name prime256v1 -genkey -noout -out "$TMPDIR/vapid_key.pem"
+
+  # Extract private key as hex (32 bytes)
+  # Use ASN.1 parse to get the privateKey OCTET STRING -> hexdump
+  PRIVATE_HEX=$(openssl asn1parse -in "$TMPDIR/vapid_key.pem" -strparse 16 -out "$TMPDIR/priv.bin" 2>/dev/null || true)
+  if [[ -s "$TMPDIR/priv.bin" ]]; then
+    PRIVATE_HEX=$(xxd -p -c 256 "$TMPDIR/priv.bin")
+  else
+    # Fallback: use openssl ec -in key -text -noout and parse
+    PRIVATE_HEX=$(openssl ec -in "$TMPDIR/vapid_key.pem" -text -noout 2>/dev/null | awk '/priv:/{flag=1;next}/pub:/{flag=0}flag' | tr -d '\n' | sed 's/://g' | sed 's/^ *//')
+  fi
+
+  # Convert hex to raw
+  printf "%s" "$PRIVATE_HEX" | xxd -r -p > "$TMPDIR/priv.raw"
+
+  # Extract public key in uncompressed point form (04||X||Y)
+  openssl ec -in "$TMPDIR/vapid_key.pem" -pubout -outform DER -out "$TMPDIR/pub.der"
+  # Convert DER PUBLIC KEY to raw EC point using openssl ec -pubin -in pem -> text then parse
+  # Simpler: create PEM public and extract the uncompressed point with openssl ec -in -pubout -text
+  openssl ec -in "$TMPDIR/vapid_key.pem" -pubout -out "$TMPDIR/pub.pem"
+  PUB_POINT_HEX=$(openssl ec -in "$TMPDIR/pub.pem" -pubout -text -noout 2>/dev/null | awk '/pub:/{flag=1;next}/ASN1 OID:/{flag=0}flag' | tr -d '\n' | sed 's/://g' | sed 's/^ *//')
+
+  # The pub: section usually contains X and Y lines one after another; ensure it's 64 bytes (128 hex chars)
+  PUB_POINT_RAW=$(printf "%s" "$PUB_POINT_HEX" | xxd -r -p > "$TMPDIR/pub.raw"; echo "$TMPDIR/pub.raw")
+
+  # Some OpenSSL outputs X and Y preceded by "04"; ensure uncompressed point
+  # Build uncompressed point: 0x04 + X + Y
+  # Try to get X and Y by reading the pub.pem with openssl ec -in pub.pem -pubout -text -noout and parsing
+  # For simplicity, derive public point from private key using openssl ec -in key -text -noout and parse pub: hex
+  PUB_HEX=$(openssl ec -in "$TMPDIR/vapid_key.pem" -text -noout 2>/dev/null | awk '/pub:/{flag=1;next}/ASN1 OID:/{flag=0}flag' | tr -d '\n' | sed 's/://g' | sed 's/^ *//')
+
+  if [[ -z "$PUB_HEX" ]]; then
+    echo "Failed to extract public key hex from OpenSSL output" >&2
+    exit 1
+  fi
+
+  # Ensure pub hex starts with 04 (uncompressed) or add it
+  if [[ ${PUB_HEX:0:2} != "04" ]]; then
+    PUB_HEX="04${PUB_HEX}"
+  fi
+
+  # Convert private and public raw to base64url
+  # base64url: standard base64, replace +/ with -_, strip =
+  VAPID_PRIVATE_KEY=$(xxd -r -p <<<"$PRIVATE_HEX" | openssl base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+  VAPID_PUBLIC_KEY=$(xxd -r -p <<<"$PUB_HEX" | openssl base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+
+  echo "Generated VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY"
+fi
+
+# Print env for user's reference
+cat <<EOF
+Environment values:
+  SECRET_KEY_BASE=${SECRET_KEY_BASE}
+  VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}
+  VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}
+  TLS_DOMAIN=${DOMAIN}
+EOF
+
+if [[ "$NO_RUN" -eq 1 ]]; then
+  echo "--no-run specified; exiting after build and key generation"
+  exit 0
+fi
+
+# Run container
+set -x
+docker run \
+  --publish 80:80 --publish 443:443 \
+  --restart unless-stopped \
+  --volume ${VOLUME_NAME}:/rails/storage \
+  --env SECRET_KEY_BASE="${SECRET_KEY_BASE}" \
+  --env VAPID_PUBLIC_KEY="${VAPID_PUBLIC_KEY}" \
+  --env VAPID_PRIVATE_KEY="${VAPID_PRIVATE_KEY}" \
+  --env TLS_DOMAIN="${DOMAIN}" \
+  "${IMAGE_TAG}"

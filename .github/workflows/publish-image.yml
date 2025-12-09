@@ -199,4 +199,46 @@ jobs:
             cosign sign --yes "$tag"
           done <<< "$tags"
 
+  deploy:
+    name: Deploy to Hetzner
+    needs: manifest # IMPORTANT: Waits for the multi-arch manifest to be ready
+    if: github.ref == 'refs/heads/main' # Only deploy when pushing to main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            # 1. Login to GHCR on the server so we can pull the private image
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+            # 2. Calculate the image name (ensure lowercase to match your build script)
+            IMAGE_REF="ghcr.io/${{ github.repository }}"
+            IMAGE_NAME="${IMAGE_REF,,}:main"
+
+            # 3. Pull the new image
+            echo "Pulling $IMAGE_NAME..."
+            docker pull $IMAGE_NAME
+
+            # 4. Stop and remove the old container
+            docker stop campfire_app || true
+            docker rm campfire_app || true
+
+            # 5. Start the new container
+            # We use the secrets you configured in GitHub for the environment variables
+            docker run -d \
+              --name campfire_app \
+              --restart unless-stopped \
+              --publish 80:80 --publish 443:443 \
+              --volume campfire:/rails/storage \
+              --env SECRET_KEY_BASE=${{ secrets.CAMPFIRE_SECRET_KEY }} \
+              --env VAPID_PUBLIC_KEY=${{ secrets.CAMPFIRE_VAPID_PUB }} \
+              --env VAPID_PRIVATE_KEY=${{ secrets.CAMPFIRE_VAPID_PRIV }} \
+              --env TLS_DOMAIN=${{ secrets.CAMPFIRE_DOMAIN }} \
+              $IMAGE_NAME
+
+            # 6. Clean up old images to save disk space
+            docker image prune -f

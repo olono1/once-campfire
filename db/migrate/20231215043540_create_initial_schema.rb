@@ -61,7 +61,7 @@ class CreateInitialSchema < ActiveRecord::Migration[7.2]
       t.datetime "created_at", null: false
       t.datetime "updated_at", null: false
       t.datetime "unread_at"
-      t.string "involvement", default: "mentions"
+      t.string "involvement", default: "everything"
       t.integer "connections", default: 0, null: false
       t.datetime "connected_at"
       t.index [ "room_id", "created_at" ], name: "index_memberships_on_room_id_and_created_at"
